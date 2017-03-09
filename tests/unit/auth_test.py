@@ -7,12 +7,12 @@ import os.path
 import random
 import shutil
 import tempfile
+import unittest
 
-from docker import auth
-from docker.auth.auth import parse_auth
-from docker import errors
+from py.test import ensuretemp
+from pytest import mark
 
-from .. import base
+from docker import auth, errors
 
 try:
     from unittest import mock
@@ -20,7 +20,7 @@ except ImportError:
     import mock
 
 
-class RegressionTest(base.BaseTestCase):
+class RegressionTest(unittest.TestCase):
     def test_803_urlsafe_encode(self):
         auth_data = {
             'username': 'root',
@@ -31,7 +31,7 @@ class RegressionTest(base.BaseTestCase):
         assert b'_' in encoded
 
 
-class ResolveRepositoryNameTest(base.BaseTestCase):
+class ResolveRepositoryNameTest(unittest.TestCase):
     def test_resolve_repository_name_hub_library_image(self):
         self.assertEqual(
             auth.resolve_repository_name('image'),
@@ -117,12 +117,12 @@ def encode_auth(auth_info):
         auth_info.get('password', '').encode('utf-8'))
 
 
-class ResolveAuthTest(base.BaseTestCase):
+class ResolveAuthTest(unittest.TestCase):
     index_config = {'auth': encode_auth({'username': 'indexuser'})}
     private_config = {'auth': encode_auth({'username': 'privateuser'})}
     legacy_config = {'auth': encode_auth({'username': 'legacyauth'})}
 
-    auth_config = parse_auth({
+    auth_config = auth.parse_auth({
         'https://index.docker.io/v1/': index_config,
         'my.registry.net': private_config,
         'http://legacy.registry.url/v1/': legacy_config,
@@ -272,7 +272,57 @@ class ResolveAuthTest(base.BaseTestCase):
         )
 
 
-class LoadConfigTest(base.Cleanup, base.BaseTestCase):
+class FindConfigFileTest(unittest.TestCase):
+    def tmpdir(self, name):
+        tmpdir = ensuretemp(name)
+        self.addCleanup(tmpdir.remove)
+        return tmpdir
+
+    def test_find_config_fallback(self):
+        tmpdir = self.tmpdir('test_find_config_fallback')
+
+        with mock.patch.dict(os.environ, {'HOME': str(tmpdir)}):
+            assert auth.find_config_file() is None
+
+    def test_find_config_from_explicit_path(self):
+        tmpdir = self.tmpdir('test_find_config_from_explicit_path')
+        config_path = tmpdir.ensure('my-config-file.json')
+
+        assert auth.find_config_file(str(config_path)) == str(config_path)
+
+    def test_find_config_from_environment(self):
+        tmpdir = self.tmpdir('test_find_config_from_environment')
+        config_path = tmpdir.ensure('config.json')
+
+        with mock.patch.dict(os.environ, {'DOCKER_CONFIG': str(tmpdir)}):
+            assert auth.find_config_file() == str(config_path)
+
+    @mark.skipif("sys.platform == 'win32'")
+    def test_find_config_from_home_posix(self):
+        tmpdir = self.tmpdir('test_find_config_from_home_posix')
+        config_path = tmpdir.ensure('.docker', 'config.json')
+
+        with mock.patch.dict(os.environ, {'HOME': str(tmpdir)}):
+            assert auth.find_config_file() == str(config_path)
+
+    @mark.skipif("sys.platform == 'win32'")
+    def test_find_config_from_home_legacy_name(self):
+        tmpdir = self.tmpdir('test_find_config_from_home_legacy_name')
+        config_path = tmpdir.ensure('.dockercfg')
+
+        with mock.patch.dict(os.environ, {'HOME': str(tmpdir)}):
+            assert auth.find_config_file() == str(config_path)
+
+    @mark.skipif("sys.platform != 'win32'")
+    def test_find_config_from_home_windows(self):
+        tmpdir = self.tmpdir('test_find_config_from_home_windows')
+        config_path = tmpdir.ensure('.docker', 'config.json')
+
+        with mock.patch.dict(os.environ, {'USERPROFILE': str(tmpdir)}):
+            assert auth.find_config_file() == str(config_path)
+
+
+class LoadConfigTest(unittest.TestCase):
     def test_load_config_no_file(self):
         folder = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, folder)
@@ -460,4 +510,28 @@ class LoadConfigTest(base.Cleanup, base.BaseTestCase):
             json.dump(config, f)
 
         cfg = auth.load_config(dockercfg_path)
-        assert cfg == {}
+        assert cfg == {'scarlet.net': {}}
+
+    def test_load_config_identity_token(self):
+        folder = tempfile.mkdtemp()
+        registry = 'scarlet.net'
+        token = '1ce1cebb-503e-7043-11aa-7feb8bd4a1ce'
+        self.addCleanup(shutil.rmtree, folder)
+        dockercfg_path = os.path.join(folder, 'config.json')
+        auth_entry = encode_auth({'username': 'sakuya'}).decode('ascii')
+        config = {
+            'auths': {
+                registry: {
+                    'auth': auth_entry,
+                    'identitytoken': token
+                }
+            }
+        }
+        with open(dockercfg_path, 'w') as f:
+            json.dump(config, f)
+
+        cfg = auth.load_config(dockercfg_path)
+        assert registry in cfg
+        cfg = cfg[registry]
+        assert 'IdentityToken' in cfg
+        assert cfg['IdentityToken'] == token

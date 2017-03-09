@@ -1,12 +1,15 @@
 import functools
 import io
 
+import six
 import win32file
 import win32pipe
 
+cERROR_PIPE_BUSY = 0xe7
 cSECURITY_SQOS_PRESENT = 0x100000
 cSECURITY_ANONYMOUS = 0
-cPIPE_READMODE_MESSAGE = 2
+
+RETRY_WAIT_TIMEOUT = 10000
 
 
 def check_closed(f):
@@ -26,6 +29,7 @@ class NpipeSocket(object):
         and server-specific methods (bind, listen, accept...) are not
         implemented.
     """
+
     def __init__(self, handle=None):
         self._timeout = win32pipe.NMPWAIT_USE_DEFAULT_WAIT
         self._handle = handle
@@ -44,15 +48,27 @@ class NpipeSocket(object):
     @check_closed
     def connect(self, address):
         win32pipe.WaitNamedPipe(address, self._timeout)
-        handle = win32file.CreateFile(
-            address,
-            win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-            0,
-            None,
-            win32file.OPEN_EXISTING,
-            cSECURITY_ANONYMOUS | cSECURITY_SQOS_PRESENT,
-            0
-        )
+        try:
+            handle = win32file.CreateFile(
+                address,
+                win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                0,
+                None,
+                win32file.OPEN_EXISTING,
+                cSECURITY_ANONYMOUS | cSECURITY_SQOS_PRESENT,
+                0
+            )
+        except win32pipe.error as e:
+            # See Remarks:
+            # https://msdn.microsoft.com/en-us/library/aa365800.aspx
+            if e.winerror == cERROR_PIPE_BUSY:
+                # Another program or thread has grabbed our pipe instance
+                # before we got to it. Wait for availability and attempt to
+                # connect again.
+                win32pipe.WaitNamedPipe(address, RETRY_WAIT_TIMEOUT)
+                return self.connect(address)
+            raise e
+
         self.flags = win32pipe.GetNamedPipeInfo(handle)[0]
 
         self._handle = handle
@@ -94,7 +110,7 @@ class NpipeSocket(object):
         if mode.strip('b') != 'r':
             raise NotImplementedError()
         rawio = NpipeFileIOBase(self)
-        if bufsize is None or bufsize < 0:
+        if bufsize is None or bufsize <= 0:
             bufsize = io.DEFAULT_BUFFER_SIZE
         return io.BufferedReader(rawio, buffer_size=bufsize)
 
@@ -114,6 +130,9 @@ class NpipeSocket(object):
 
     @check_closed
     def recv_into(self, buf, nbytes=0):
+        if six.PY2:
+            return self._recv_into_py2(buf, nbytes)
+
         readbuf = buf
         if not isinstance(buf, memoryview):
             readbuf = memoryview(buf)
@@ -123,6 +142,12 @@ class NpipeSocket(object):
             readbuf[:nbytes] if nbytes else readbuf
         )
         return len(data)
+
+    def _recv_into_py2(self, buf, nbytes):
+        err, data = win32file.ReadFile(self._handle, nbytes or len(buf))
+        n = len(data)
+        buf[:n] = data
+        return n
 
     @check_closed
     def send(self, string, flags=0):
@@ -145,13 +170,16 @@ class NpipeSocket(object):
 
     def settimeout(self, value):
         if value is None:
-            self._timeout = win32pipe.NMPWAIT_NOWAIT
+            # Blocking mode
+            self._timeout = win32pipe.NMPWAIT_WAIT_FOREVER
         elif not isinstance(value, (float, int)) or value < 0:
             raise ValueError('Timeout value out of range')
         elif value == 0:
-            self._timeout = win32pipe.NMPWAIT_USE_DEFAULT_WAIT
+            # Non-blocking mode
+            self._timeout = win32pipe.NMPWAIT_NO_WAIT
         else:
-            self._timeout = value
+            # Timeout mode - Value converted to milliseconds
+            self._timeout = value * 1000
 
     def gettimeout(self):
         return self._timeout

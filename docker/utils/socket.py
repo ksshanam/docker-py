@@ -5,6 +5,11 @@ import struct
 
 import six
 
+try:
+    from ..transport import NpipeSocket
+except ImportError:
+    NpipeSocket = type(None)
+
 
 class SocketError(Exception):
     pass
@@ -14,10 +19,12 @@ def read(socket, n=4096):
     """
     Reads at most n bytes from socket
     """
+
     recoverable_errors = (errno.EINTR, errno.EDEADLK, errno.EWOULDBLOCK)
 
     # wait for data to become available
-    select.select([socket], [], [])
+    if not isinstance(socket, NpipeSocket):
+        select.select([socket], [], [])
 
     try:
         if hasattr(socket, 'recv'):
@@ -62,7 +69,11 @@ def frames_iter(socket):
     """
     Returns a generator of frames read from socket
     """
-    n = next_frame_size(socket)
-    while n > 0:
-        yield read(socket, n)
+    while True:
         n = next_frame_size(socket)
+        if n == 0:
+            break
+        while n > 0:
+            result = read(socket, n)
+            n -= len(result)
+            yield result

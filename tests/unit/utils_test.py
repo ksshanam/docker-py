@@ -5,28 +5,28 @@ import json
 import os
 import os.path
 import shutil
+import socket
 import sys
 import tarfile
 import tempfile
+import unittest
 
 import pytest
 import six
 
-from docker.client import Client
-from docker.constants import DEFAULT_DOCKER_API_VERSION
-from docker.errors import DockerException, InvalidVersion
+from docker.api.client import APIClient
+from docker.constants import IS_WINDOWS_PLATFORM
+from docker.errors import DockerException
 from docker.utils import (
     parse_repository_tag, parse_host, convert_filters, kwargs_from_env,
-    create_host_config, Ulimit, LogConfig, parse_bytes, parse_env_file,
-    exclude_paths, convert_volume_binds, decode_json_header, tar,
-    split_command, create_ipam_config, create_ipam_pool, parse_devices,
-    update_headers,
+    parse_bytes, parse_env_file, exclude_paths, convert_volume_binds,
+    decode_json_header, tar, split_command, parse_devices, update_headers,
 )
 
+from docker.utils.build import should_check_directory
 from docker.utils.ports import build_port_bindings, split_port
-from docker.utils.utils import create_endpoint_config
+from docker.utils.utils import format_environment
 
-from .. import base
 from ..helpers import make_tree
 
 
@@ -36,7 +36,7 @@ TEST_CERT_DIR = os.path.join(
 )
 
 
-class DecoratorsTest(base.BaseTestCase):
+class DecoratorsTest(unittest.TestCase):
     def test_update_headers(self):
         sample_headers = {
             'X-Docker-Locale': 'en-US',
@@ -45,7 +45,7 @@ class DecoratorsTest(base.BaseTestCase):
         def f(self, headers=None):
             return headers
 
-        client = Client()
+        client = APIClient()
         client._auth_configs = {}
 
         g = update_headers(f)
@@ -67,204 +67,7 @@ class DecoratorsTest(base.BaseTestCase):
         }
 
 
-class HostConfigTest(base.BaseTestCase):
-    def test_create_host_config_no_options(self):
-        config = create_host_config(version='1.19')
-        self.assertFalse('NetworkMode' in config)
-
-    def test_create_host_config_no_options_newer_api_version(self):
-        config = create_host_config(version='1.20')
-        self.assertEqual(config['NetworkMode'], 'default')
-
-    def test_create_host_config_invalid_cpu_cfs_types(self):
-        with pytest.raises(TypeError):
-            create_host_config(version='1.20', cpu_quota='0')
-
-        with pytest.raises(TypeError):
-            create_host_config(version='1.20', cpu_period='0')
-
-        with pytest.raises(TypeError):
-            create_host_config(version='1.20', cpu_quota=23.11)
-
-        with pytest.raises(TypeError):
-            create_host_config(version='1.20', cpu_period=1999.0)
-
-    def test_create_host_config_with_cpu_quota(self):
-        config = create_host_config(version='1.20', cpu_quota=1999)
-        self.assertEqual(config.get('CpuQuota'), 1999)
-
-    def test_create_host_config_with_cpu_period(self):
-        config = create_host_config(version='1.20', cpu_period=1999)
-        self.assertEqual(config.get('CpuPeriod'), 1999)
-
-    def test_create_host_config_with_blkio_constraints(self):
-        blkio_rate = [{"Path": "/dev/sda", "Rate": 1000}]
-        config = create_host_config(version='1.22',
-                                    blkio_weight=1999,
-                                    blkio_weight_device=blkio_rate,
-                                    device_read_bps=blkio_rate,
-                                    device_write_bps=blkio_rate,
-                                    device_read_iops=blkio_rate,
-                                    device_write_iops=blkio_rate)
-
-        self.assertEqual(config.get('BlkioWeight'), 1999)
-        self.assertTrue(config.get('BlkioWeightDevice') is blkio_rate)
-        self.assertTrue(config.get('BlkioDeviceReadBps') is blkio_rate)
-        self.assertTrue(config.get('BlkioDeviceWriteBps') is blkio_rate)
-        self.assertTrue(config.get('BlkioDeviceReadIOps') is blkio_rate)
-        self.assertTrue(config.get('BlkioDeviceWriteIOps') is blkio_rate)
-        self.assertEqual(blkio_rate[0]['Path'], "/dev/sda")
-        self.assertEqual(blkio_rate[0]['Rate'], 1000)
-
-    def test_create_host_config_with_shm_size(self):
-        config = create_host_config(version='1.22', shm_size=67108864)
-        self.assertEqual(config.get('ShmSize'), 67108864)
-
-    def test_create_host_config_with_shm_size_in_mb(self):
-        config = create_host_config(version='1.22', shm_size='64M')
-        self.assertEqual(config.get('ShmSize'), 67108864)
-
-    def test_create_host_config_with_oom_kill_disable(self):
-        config = create_host_config(version='1.20', oom_kill_disable=True)
-        self.assertEqual(config.get('OomKillDisable'), True)
-        self.assertRaises(
-            InvalidVersion, lambda: create_host_config(version='1.18.3',
-                                                       oom_kill_disable=True))
-
-    def test_create_host_config_with_userns_mode(self):
-        config = create_host_config(version='1.23', userns_mode='host')
-        self.assertEqual(config.get('UsernsMode'), 'host')
-        self.assertRaises(
-            InvalidVersion, lambda: create_host_config(version='1.22',
-                                                       userns_mode='host'))
-        self.assertRaises(
-            ValueError, lambda: create_host_config(version='1.23',
-                                                   userns_mode='host12'))
-
-    def test_create_host_config_with_oom_score_adj(self):
-        config = create_host_config(version='1.22', oom_score_adj=100)
-        self.assertEqual(config.get('OomScoreAdj'), 100)
-        self.assertRaises(
-            InvalidVersion, lambda: create_host_config(version='1.21',
-                                                       oom_score_adj=100))
-        self.assertRaises(
-            TypeError, lambda: create_host_config(version='1.22',
-                                                  oom_score_adj='100'))
-
-    def test_create_host_config_with_dns_opt(self):
-
-        tested_opts = ['use-vc', 'no-tld-query']
-        config = create_host_config(version='1.21', dns_opt=tested_opts)
-        dns_opts = config.get('DnsOptions')
-
-        self.assertTrue('use-vc' in dns_opts)
-        self.assertTrue('no-tld-query' in dns_opts)
-
-        self.assertRaises(
-            InvalidVersion, lambda: create_host_config(version='1.20',
-                                                       dns_opt=tested_opts))
-
-    def test_create_endpoint_config_with_aliases(self):
-        config = create_endpoint_config(version='1.22', aliases=['foo', 'bar'])
-        assert config == {'Aliases': ['foo', 'bar']}
-
-        with pytest.raises(InvalidVersion):
-            create_endpoint_config(version='1.21', aliases=['foo', 'bar'])
-
-    def test_create_host_config_with_mem_reservation(self):
-        config = create_host_config(version='1.21', mem_reservation=67108864)
-        self.assertEqual(config.get('MemoryReservation'), 67108864)
-        self.assertRaises(
-            InvalidVersion, lambda: create_host_config(
-                version='1.20', mem_reservation=67108864))
-
-    def test_create_host_config_with_kernel_memory(self):
-        config = create_host_config(version='1.21', kernel_memory=67108864)
-        self.assertEqual(config.get('KernelMemory'), 67108864)
-        self.assertRaises(
-            InvalidVersion, lambda: create_host_config(
-                version='1.20', kernel_memory=67108864))
-
-    def test_create_host_config_with_pids_limit(self):
-        config = create_host_config(version='1.23', pids_limit=1024)
-        self.assertEqual(config.get('PidsLimit'), 1024)
-
-        with pytest.raises(InvalidVersion):
-            create_host_config(version='1.22', pids_limit=1024)
-        with pytest.raises(TypeError):
-            create_host_config(version='1.22', pids_limit='1024')
-
-
-class UlimitTest(base.BaseTestCase):
-    def test_create_host_config_dict_ulimit(self):
-        ulimit_dct = {'name': 'nofile', 'soft': 8096}
-        config = create_host_config(
-            ulimits=[ulimit_dct], version=DEFAULT_DOCKER_API_VERSION
-        )
-        self.assertIn('Ulimits', config)
-        self.assertEqual(len(config['Ulimits']), 1)
-        ulimit_obj = config['Ulimits'][0]
-        self.assertTrue(isinstance(ulimit_obj, Ulimit))
-        self.assertEqual(ulimit_obj.name, ulimit_dct['name'])
-        self.assertEqual(ulimit_obj.soft, ulimit_dct['soft'])
-        self.assertEqual(ulimit_obj['Soft'], ulimit_obj.soft)
-
-    def test_create_host_config_dict_ulimit_capitals(self):
-        ulimit_dct = {'Name': 'nofile', 'Soft': 8096, 'Hard': 8096 * 4}
-        config = create_host_config(
-            ulimits=[ulimit_dct], version=DEFAULT_DOCKER_API_VERSION
-        )
-        self.assertIn('Ulimits', config)
-        self.assertEqual(len(config['Ulimits']), 1)
-        ulimit_obj = config['Ulimits'][0]
-        self.assertTrue(isinstance(ulimit_obj, Ulimit))
-        self.assertEqual(ulimit_obj.name, ulimit_dct['Name'])
-        self.assertEqual(ulimit_obj.soft, ulimit_dct['Soft'])
-        self.assertEqual(ulimit_obj.hard, ulimit_dct['Hard'])
-        self.assertEqual(ulimit_obj['Soft'], ulimit_obj.soft)
-
-    def test_create_host_config_obj_ulimit(self):
-        ulimit_dct = Ulimit(name='nofile', soft=8096)
-        config = create_host_config(
-            ulimits=[ulimit_dct], version=DEFAULT_DOCKER_API_VERSION
-        )
-        self.assertIn('Ulimits', config)
-        self.assertEqual(len(config['Ulimits']), 1)
-        ulimit_obj = config['Ulimits'][0]
-        self.assertTrue(isinstance(ulimit_obj, Ulimit))
-        self.assertEqual(ulimit_obj, ulimit_dct)
-
-    def test_ulimit_invalid_type(self):
-        self.assertRaises(ValueError, lambda: Ulimit(name=None))
-        self.assertRaises(ValueError, lambda: Ulimit(name='hello', soft='123'))
-        self.assertRaises(ValueError, lambda: Ulimit(name='hello', hard='456'))
-
-
-class LogConfigTest(base.BaseTestCase):
-    def test_create_host_config_dict_logconfig(self):
-        dct = {'type': LogConfig.types.SYSLOG, 'config': {'key1': 'val1'}}
-        config = create_host_config(
-            version=DEFAULT_DOCKER_API_VERSION, log_config=dct
-        )
-        self.assertIn('LogConfig', config)
-        self.assertTrue(isinstance(config['LogConfig'], LogConfig))
-        self.assertEqual(dct['type'], config['LogConfig'].type)
-
-    def test_create_host_config_obj_logconfig(self):
-        obj = LogConfig(type=LogConfig.types.SYSLOG, config={'key1': 'val1'})
-        config = create_host_config(
-            version=DEFAULT_DOCKER_API_VERSION, log_config=obj
-        )
-        self.assertIn('LogConfig', config)
-        self.assertTrue(isinstance(config['LogConfig'], LogConfig))
-        self.assertEqual(obj, config['LogConfig'])
-
-    def test_logconfig_invalid_config_type(self):
-        with pytest.raises(ValueError):
-            LogConfig(type=LogConfig.types.JSON, config='helloworld')
-
-
-class KwargsFromEnvTest(base.BaseTestCase):
+class KwargsFromEnvTest(unittest.TestCase):
     def setUp(self):
         self.os_environ = os.environ.copy()
 
@@ -292,7 +95,7 @@ class KwargsFromEnvTest(base.BaseTestCase):
         self.assertEqual(False, kwargs['tls'].assert_hostname)
         self.assertTrue(kwargs['tls'].verify)
         try:
-            client = Client(**kwargs)
+            client = APIClient(**kwargs)
             self.assertEqual(kwargs['base_url'], client.base_url)
             self.assertEqual(kwargs['tls'].ca_cert, client.verify)
             self.assertEqual(kwargs['tls'].cert, client.cert)
@@ -311,7 +114,7 @@ class KwargsFromEnvTest(base.BaseTestCase):
         self.assertEqual(True, kwargs['tls'].assert_hostname)
         self.assertEqual(False, kwargs['tls'].verify)
         try:
-            client = Client(**kwargs)
+            client = APIClient(**kwargs)
             self.assertEqual(kwargs['base_url'], client.base_url)
             self.assertEqual(kwargs['tls'].cert, client.cert)
             self.assertFalse(kwargs['tls'].verify)
@@ -364,7 +167,7 @@ class KwargsFromEnvTest(base.BaseTestCase):
         assert 'tls' not in kwargs
 
 
-class ConverVolumeBindsTest(base.BaseTestCase):
+class ConverVolumeBindsTest(unittest.TestCase):
     def test_convert_volume_binds_empty(self):
         self.assertEqual(convert_volume_binds({}), [])
         self.assertEqual(convert_volume_binds([]), [])
@@ -423,7 +226,7 @@ class ConverVolumeBindsTest(base.BaseTestCase):
         )
 
 
-class ParseEnvFileTest(base.BaseTestCase):
+class ParseEnvFileTest(unittest.TestCase):
     def generate_tempfile(self, file_content=None):
         """
         Generates a temporary file for tests with the content
@@ -454,8 +257,16 @@ class ParseEnvFileTest(base.BaseTestCase):
     def test_parse_env_file_commented_line(self):
         env_file = self.generate_tempfile(
             file_content='USER=jdoe\n#PASS=secret')
-        get_parse_env_file = parse_env_file((env_file))
+        get_parse_env_file = parse_env_file(env_file)
         self.assertEqual(get_parse_env_file, {'USER': 'jdoe'})
+        os.unlink(env_file)
+
+    def test_parse_env_file_newline(self):
+        env_file = self.generate_tempfile(
+            file_content='\nUSER=jdoe\n\n\nPASS=secret')
+        get_parse_env_file = parse_env_file(env_file)
+        self.assertEqual(get_parse_env_file,
+                         {'USER': 'jdoe', 'PASS': 'secret'})
         os.unlink(env_file)
 
     def test_parse_env_file_invalid_line(self):
@@ -466,7 +277,7 @@ class ParseEnvFileTest(base.BaseTestCase):
         os.unlink(env_file)
 
 
-class ParseHostTest(base.BaseTestCase):
+class ParseHostTest(unittest.TestCase):
     def test_parse_host(self):
         invalid_hosts = [
             '0.0.0.0',
@@ -522,8 +333,13 @@ class ParseHostTest(base.BaseTestCase):
         expected_result = 'https://myhost.docker.net:3348'
         assert parse_host(host_value, tls=True) == expected_result
 
+    def test_parse_host_trailing_slash(self):
+        host_value = 'tcp://myhost.docker.net:2376/'
+        expected_result = 'http://myhost.docker.net:2376'
+        assert parse_host(host_value) == expected_result
 
-class ParseRepositoryTagTest(base.BaseTestCase):
+
+class ParseRepositoryTagTest(unittest.TestCase):
     sha = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
 
     def test_index_image_no_tag(self):
@@ -569,7 +385,7 @@ class ParseRepositoryTagTest(base.BaseTestCase):
         )
 
 
-class ParseDeviceTest(base.BaseTestCase):
+class ParseDeviceTest(unittest.TestCase):
     def test_dict(self):
         devices = parse_devices([{
             'PathOnHost': '/dev/sda1',
@@ -628,7 +444,7 @@ class ParseDeviceTest(base.BaseTestCase):
         })
 
 
-class ParseBytesTest(base.BaseTestCase):
+class ParseBytesTest(unittest.TestCase):
     def test_parse_bytes_valid(self):
         self.assertEqual(parse_bytes("512MB"), 536870912)
         self.assertEqual(parse_bytes("512M"), 536870912)
@@ -648,7 +464,7 @@ class ParseBytesTest(base.BaseTestCase):
         )
 
 
-class UtilsTest(base.BaseTestCase):
+class UtilsTest(unittest.TestCase):
     longMessage = True
 
     def test_convert_filters(self):
@@ -672,23 +488,8 @@ class UtilsTest(base.BaseTestCase):
         decoded_data = decode_json_header(data)
         self.assertEqual(obj, decoded_data)
 
-    def test_create_ipam_config(self):
-        ipam_pool = create_ipam_pool(subnet='192.168.52.0/24',
-                                     gateway='192.168.52.254')
 
-        ipam_config = create_ipam_config(pool_configs=[ipam_pool])
-        self.assertEqual(ipam_config, {
-            'Driver': 'default',
-            'Config': [{
-                'Subnet': '192.168.52.0/24',
-                'Gateway': '192.168.52.254',
-                'AuxiliaryAddresses': None,
-                'IPRange': None,
-            }]
-        })
-
-
-class SplitCommandTest(base.BaseTestCase):
+class SplitCommandTest(unittest.TestCase):
     def test_split_command_with_unicode(self):
         self.assertEqual(split_command(u'echo μμ'), ['echo', 'μμ'])
 
@@ -697,7 +498,7 @@ class SplitCommandTest(base.BaseTestCase):
         self.assertEqual(split_command('echo μμ'), ['echo', 'μμ'])
 
 
-class PortsTest(base.BaseTestCase):
+class PortsTest(unittest.TestCase):
     def test_split_port_with_host_ip(self):
         internal_port, external_port = split_port("127.0.0.1:1000:2000")
         self.assertEqual(internal_port, ["2000"])
@@ -728,6 +529,11 @@ class PortsTest(base.BaseTestCase):
         internal_port, external_port = split_port("1000-1001:2000-2001")
         self.assertEqual(internal_port, ["2000", "2001"])
         self.assertEqual(external_port, ["1000", "1001"])
+
+    def test_split_port_random_port_range_with_host_port(self):
+        internal_port, external_port = split_port("1000-1001:2000")
+        self.assertEqual(internal_port, ["2000"])
+        self.assertEqual(external_port, ["1000-1001"])
 
     def test_split_port_no_host_port(self):
         internal_port, external_port = split_port("2000")
@@ -804,7 +610,13 @@ class PortsTest(base.BaseTestCase):
         self.assertEqual(port_bindings["2000"], [("127.0.0.1", "2000")])
 
 
-class ExcludePathsTest(base.BaseTestCase):
+def convert_paths(collection):
+    if not IS_WINDOWS_PLATFORM:
+        return collection
+    return set(map(lambda x: x.replace('/', '\\'), collection))
+
+
+class ExcludePathsTest(unittest.TestCase):
     dirs = [
         'foo',
         'foo/bar',
@@ -838,7 +650,7 @@ class ExcludePathsTest(base.BaseTestCase):
         return set(exclude_paths(self.base, patterns, dockerfile=dockerfile))
 
     def test_no_excludes(self):
-        assert self.exclude(['']) == self.all_paths
+        assert self.exclude(['']) == convert_paths(self.all_paths)
 
     def test_no_dupes(self):
         paths = exclude_paths(self.base, ['!a.py'])
@@ -853,7 +665,9 @@ class ExcludePathsTest(base.BaseTestCase):
         Dockerfile and/or .dockerignore, don't exclude them from
         the actual tar file.
         """
-        assert self.exclude(['Dockerfile', '.dockerignore']) == self.all_paths
+        assert self.exclude(['Dockerfile', '.dockerignore']) == convert_paths(
+            self.all_paths
+        )
 
     def test_exclude_custom_dockerfile(self):
         """
@@ -872,97 +686,148 @@ class ExcludePathsTest(base.BaseTestCase):
         assert 'foo/a.py' not in includes
 
     def test_single_filename(self):
-        assert self.exclude(['a.py']) == self.all_paths - set(['a.py'])
+        assert self.exclude(['a.py']) == convert_paths(
+            self.all_paths - set(['a.py'])
+        )
 
     def test_single_filename_leading_dot_slash(self):
-        assert self.exclude(['./a.py']) == self.all_paths - set(['a.py'])
+        assert self.exclude(['./a.py']) == convert_paths(
+            self.all_paths - set(['a.py'])
+        )
 
     # As odd as it sounds, a filename pattern with a trailing slash on the
     # end *will* result in that file being excluded.
     def test_single_filename_trailing_slash(self):
-        assert self.exclude(['a.py/']) == self.all_paths - set(['a.py'])
+        assert self.exclude(['a.py/']) == convert_paths(
+            self.all_paths - set(['a.py'])
+        )
 
     def test_wildcard_filename_start(self):
-        assert self.exclude(['*.py']) == self.all_paths - set([
-            'a.py', 'b.py', 'cde.py',
-        ])
+        assert self.exclude(['*.py']) == convert_paths(
+            self.all_paths - set(['a.py', 'b.py', 'cde.py'])
+        )
 
     def test_wildcard_with_exception(self):
-        assert self.exclude(['*.py', '!b.py']) == self.all_paths - set([
-            'a.py', 'cde.py',
-        ])
+        assert self.exclude(['*.py', '!b.py']) == convert_paths(
+            self.all_paths - set(['a.py', 'cde.py'])
+        )
 
     def test_wildcard_with_wildcard_exception(self):
-        assert self.exclude(['*.*', '!*.go']) == self.all_paths - set([
-            'a.py', 'b.py', 'cde.py', 'Dockerfile.alt',
-        ])
+        assert self.exclude(['*.*', '!*.go']) == convert_paths(
+            self.all_paths - set([
+                'a.py', 'b.py', 'cde.py', 'Dockerfile.alt',
+            ])
+        )
 
     def test_wildcard_filename_end(self):
-        assert self.exclude(['a.*']) == self.all_paths - set(['a.py', 'a.go'])
+        assert self.exclude(['a.*']) == convert_paths(
+            self.all_paths - set(['a.py', 'a.go'])
+        )
 
     def test_question_mark(self):
-        assert self.exclude(['?.py']) == self.all_paths - set(['a.py', 'b.py'])
+        assert self.exclude(['?.py']) == convert_paths(
+            self.all_paths - set(['a.py', 'b.py'])
+        )
 
     def test_single_subdir_single_filename(self):
-        assert self.exclude(['foo/a.py']) == self.all_paths - set(['foo/a.py'])
+        assert self.exclude(['foo/a.py']) == convert_paths(
+            self.all_paths - set(['foo/a.py'])
+        )
 
     def test_single_subdir_with_path_traversal(self):
-        assert self.exclude(['foo/whoops/../a.py']) == self.all_paths - set([
-            'foo/a.py',
-        ])
+        assert self.exclude(['foo/whoops/../a.py']) == convert_paths(
+            self.all_paths - set(['foo/a.py'])
+        )
 
     def test_single_subdir_wildcard_filename(self):
-        assert self.exclude(['foo/*.py']) == self.all_paths - set([
-            'foo/a.py', 'foo/b.py',
-        ])
+        assert self.exclude(['foo/*.py']) == convert_paths(
+            self.all_paths - set(['foo/a.py', 'foo/b.py'])
+        )
 
     def test_wildcard_subdir_single_filename(self):
-        assert self.exclude(['*/a.py']) == self.all_paths - set([
-            'foo/a.py', 'bar/a.py',
-        ])
+        assert self.exclude(['*/a.py']) == convert_paths(
+            self.all_paths - set(['foo/a.py', 'bar/a.py'])
+        )
 
     def test_wildcard_subdir_wildcard_filename(self):
-        assert self.exclude(['*/*.py']) == self.all_paths - set([
-            'foo/a.py', 'foo/b.py', 'bar/a.py',
-        ])
+        assert self.exclude(['*/*.py']) == convert_paths(
+            self.all_paths - set(['foo/a.py', 'foo/b.py', 'bar/a.py'])
+        )
 
     def test_directory(self):
-        assert self.exclude(['foo']) == self.all_paths - set([
-            'foo', 'foo/a.py', 'foo/b.py',
-            'foo/bar', 'foo/bar/a.py', 'foo/Dockerfile3'
-        ])
+        assert self.exclude(['foo']) == convert_paths(
+            self.all_paths - set([
+                'foo', 'foo/a.py', 'foo/b.py', 'foo/bar', 'foo/bar/a.py',
+                'foo/Dockerfile3'
+            ])
+        )
 
     def test_directory_with_trailing_slash(self):
-        assert self.exclude(['foo']) == self.all_paths - set([
-            'foo', 'foo/a.py', 'foo/b.py',
-            'foo/bar', 'foo/bar/a.py', 'foo/Dockerfile3'
-        ])
+        assert self.exclude(['foo']) == convert_paths(
+            self.all_paths - set([
+                'foo', 'foo/a.py', 'foo/b.py',
+                'foo/bar', 'foo/bar/a.py', 'foo/Dockerfile3'
+            ])
+        )
 
     def test_directory_with_single_exception(self):
-        assert self.exclude(['foo', '!foo/bar/a.py']) == self.all_paths - set([
-            'foo/a.py', 'foo/b.py', 'foo', 'foo/bar',
-            'foo/Dockerfile3'
-        ])
+        assert self.exclude(['foo', '!foo/bar/a.py']) == convert_paths(
+            self.all_paths - set([
+                'foo/a.py', 'foo/b.py', 'foo', 'foo/bar',
+                'foo/Dockerfile3'
+            ])
+        )
 
     def test_directory_with_subdir_exception(self):
-        assert self.exclude(['foo', '!foo/bar']) == self.all_paths - set([
-            'foo/a.py', 'foo/b.py', 'foo',
-            'foo/Dockerfile3'
-        ])
+        assert self.exclude(['foo', '!foo/bar']) == convert_paths(
+            self.all_paths - set([
+                'foo/a.py', 'foo/b.py', 'foo', 'foo/Dockerfile3'
+            ])
+        )
+
+    @pytest.mark.skipif(
+        not IS_WINDOWS_PLATFORM, reason='Backslash patterns only on Windows'
+    )
+    def test_directory_with_subdir_exception_win32_pathsep(self):
+        assert self.exclude(['foo', '!foo\\bar']) == convert_paths(
+            self.all_paths - set([
+                'foo/a.py', 'foo/b.py', 'foo', 'foo/Dockerfile3'
+            ])
+        )
 
     def test_directory_with_wildcard_exception(self):
-        assert self.exclude(['foo', '!foo/*.py']) == self.all_paths - set([
-            'foo/bar', 'foo/bar/a.py', 'foo',
-            'foo/Dockerfile3'
-        ])
+        assert self.exclude(['foo', '!foo/*.py']) == convert_paths(
+            self.all_paths - set([
+                'foo/bar', 'foo/bar/a.py', 'foo', 'foo/Dockerfile3'
+            ])
+        )
 
     def test_subdirectory(self):
-        assert self.exclude(['foo/bar']) == self.all_paths - set([
-            'foo/bar', 'foo/bar/a.py',
-        ])
+        assert self.exclude(['foo/bar']) == convert_paths(
+            self.all_paths - set(['foo/bar', 'foo/bar/a.py'])
+        )
+
+    @pytest.mark.skipif(
+        not IS_WINDOWS_PLATFORM, reason='Backslash patterns only on Windows'
+    )
+    def test_subdirectory_win32_pathsep(self):
+        assert self.exclude(['foo\\bar']) == convert_paths(
+            self.all_paths - set(['foo/bar', 'foo/bar/a.py'])
+        )
+
+    def test_double_wildcard(self):
+        assert self.exclude(['**/a.py']) == convert_paths(
+            self.all_paths - set(
+                ['a.py', 'foo/a.py', 'foo/bar/a.py', 'bar/a.py']
+            )
+        )
+
+        assert self.exclude(['foo/**/bar']) == convert_paths(
+            self.all_paths - set(['foo/bar', 'foo/bar/a.py'])
+        )
 
 
-class TarTest(base.Cleanup, base.BaseTestCase):
+class TarTest(unittest.TestCase):
     def test_tar_with_excludes(self):
         dirs = [
             'foo',
@@ -1018,6 +883,7 @@ class TarTest(base.Cleanup, base.BaseTestCase):
             tar_data = tarfile.open(fileobj=archive)
             self.assertEqual(sorted(tar_data.getnames()), ['bar', 'foo'])
 
+    @pytest.mark.skipif(IS_WINDOWS_PLATFORM, reason='No symlinks on Windows')
     def test_tar_with_file_symlinks(self):
         base = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, base)
@@ -1031,6 +897,7 @@ class TarTest(base.Cleanup, base.BaseTestCase):
                 sorted(tar_data.getnames()), ['bar', 'bar/foo', 'foo']
             )
 
+    @pytest.mark.skipif(IS_WINDOWS_PLATFORM, reason='No symlinks on Windows')
     def test_tar_with_directory_symlinks(self):
         base = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, base)
@@ -1042,3 +909,104 @@ class TarTest(base.Cleanup, base.BaseTestCase):
             self.assertEqual(
                 sorted(tar_data.getnames()), ['bar', 'bar/foo', 'foo']
             )
+
+    def test_tar_socket_file(self):
+        base = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, base)
+        for d in ['foo', 'bar']:
+            os.makedirs(os.path.join(base, d))
+        sock = socket.socket(socket.AF_UNIX)
+        self.addCleanup(sock.close)
+        sock.bind(os.path.join(base, 'test.sock'))
+        with tar(base) as archive:
+            tar_data = tarfile.open(fileobj=archive)
+            self.assertEqual(
+                sorted(tar_data.getnames()), ['bar', 'foo']
+            )
+
+
+class ShouldCheckDirectoryTest(unittest.TestCase):
+    exclude_patterns = [
+        'exclude_rather_large_directory',
+        'dir/with/subdir_excluded',
+        'dir/with/exceptions'
+    ]
+
+    include_patterns = [
+        'dir/with/exceptions/like_this_one',
+        'dir/with/exceptions/in/descendents'
+    ]
+
+    def test_should_check_directory_not_excluded(self):
+        self.assertTrue(
+            should_check_directory('not_excluded', self.exclude_patterns,
+                                   self.include_patterns)
+        )
+
+        self.assertTrue(
+            should_check_directory('dir/with', self.exclude_patterns,
+                                   self.include_patterns)
+        )
+
+    def test_shoud_check_parent_directories_of_excluded(self):
+        self.assertTrue(
+            should_check_directory('dir', self.exclude_patterns,
+                                   self.include_patterns)
+        )
+        self.assertTrue(
+            should_check_directory('dir/with', self.exclude_patterns,
+                                   self.include_patterns)
+        )
+
+    def test_should_not_check_excluded_directories_with_no_exceptions(self):
+        self.assertFalse(
+            should_check_directory('exclude_rather_large_directory',
+                                   self.exclude_patterns, self.include_patterns
+                                   )
+        )
+        self.assertFalse(
+            should_check_directory('dir/with/subdir_excluded',
+                                   self.exclude_patterns, self.include_patterns
+                                   )
+        )
+
+    def test_should_check_excluded_directory_with_exceptions(self):
+        self.assertTrue(
+            should_check_directory('dir/with/exceptions',
+                                   self.exclude_patterns, self.include_patterns
+                                   )
+        )
+        self.assertTrue(
+            should_check_directory('dir/with/exceptions/in',
+                                   self.exclude_patterns, self.include_patterns
+                                   )
+        )
+
+    def test_should_not_check_siblings_of_exceptions(self):
+        self.assertFalse(
+            should_check_directory('dir/with/exceptions/but_not_here',
+                                   self.exclude_patterns, self.include_patterns
+                                   )
+        )
+
+    def test_should_check_subdirectories_of_exceptions(self):
+        self.assertTrue(
+            should_check_directory('dir/with/exceptions/like_this_one/subdir',
+                                   self.exclude_patterns, self.include_patterns
+                                   )
+        )
+
+
+class FormatEnvironmentTest(unittest.TestCase):
+    def test_format_env_binary_unicode_value(self):
+        env_dict = {
+            'ARTIST_NAME': b'\xec\x86\xa1\xec\xa7\x80\xec\x9d\x80'
+        }
+        assert format_environment(env_dict) == [u'ARTIST_NAME=송지은']
+
+    def test_format_env_no_value(self):
+        env_dict = {
+            'FOO': None,
+            'BAR': '',
+        }
+        assert sorted(format_environment(env_dict)) == ['BAR=', 'FOO']
