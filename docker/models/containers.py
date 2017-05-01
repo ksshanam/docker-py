@@ -19,6 +19,24 @@ class Container(Model):
             return self.attrs['Name'].lstrip('/')
 
     @property
+    def image(self):
+        """
+        The image of the container.
+        """
+        image_id = self.attrs['Image']
+        if image_id is None:
+            return None
+        return self.client.images.get(image_id.split(':')[1])
+
+    @property
+    def labels(self):
+        """
+        The labels of a container as dictionary.
+        """
+        result = self.attrs['Config'].get('Labels')
+        return result or {}
+
+    @property
     def status(self):
         """
         The status of the container. For example, ``running``, or ``exited``.
@@ -456,6 +474,9 @@ class ContainerCollection(Collection):
             cap_add (list of str): Add kernel capabilities. For example,
                 ``["SYS_ADMIN", "MKNOD"]``.
             cap_drop (list of str): Drop kernel capabilities.
+            cpu_count (int): Number of usable CPUs (Windows only).
+            cpu_percent (int): Usable percentage of the available CPUs
+                (Windows only).
             cpu_period (int): The length of a CPU period in microseconds.
             cpu_quota (int): Microseconds of CPU time that the container can
                 get in a CPU period.
@@ -523,6 +544,7 @@ class ContainerCollection(Collection):
             networks (:py:class:`list`): A list of network names to connect
                 this container to.
             name (str): The name for this container.
+            nano_cpus (int):  CPU quota in units of 10-9 CPUs.
             network_disabled (bool): Disable networking.
             network_mode (str): One of:
 
@@ -801,6 +823,8 @@ RUN_HOST_CONFIG_KWARGS = [
     'cap_add',
     'cap_drop',
     'cgroup_parent',
+    'cpu_count',
+    'cpu_percent',
     'cpu_period',
     'cpu_quota',
     'cpu_shares',
@@ -827,6 +851,7 @@ RUN_HOST_CONFIG_KWARGS = [
     'mem_reservation',
     'mem_swappiness',
     'memswap_limit',
+    'nano_cpus',
     'network_mode',
     'oom_kill_disable',
     'oom_score_adj',
