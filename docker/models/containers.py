@@ -125,7 +125,7 @@ class Container(Model):
 
     def exec_run(self, cmd, stdout=True, stderr=True, stdin=False, tty=False,
                  privileged=False, user='', detach=False, stream=False,
-                 socket=False):
+                 socket=False, environment=None):
         """
         Run a command inside this container. Similar to
         ``docker exec``.
@@ -141,6 +141,9 @@ class Container(Model):
             detach (bool): If true, detach from the exec command.
                 Default: False
             stream (bool): Stream response data. Default: False
+            environment (dict or list): A dictionary or a list of strings in
+                the following format ``["PASSWORD=xxx"]`` or
+                ``{"PASSWORD": "xxx"}``.
 
         Returns:
             (generator or str): If ``stream=True``, a generator yielding
@@ -152,7 +155,7 @@ class Container(Model):
         """
         resp = self.client.api.exec_create(
             self.id, cmd, stdout=stdout, stderr=stderr, stdin=stdin, tty=tty,
-            privileged=privileged, user=user
+            privileged=privileged, user=user, environment=environment
         )
         return self.client.api.exec_start(
             resp['Id'], detach=detach, tty=tty, stream=stream, socket=socket
@@ -483,6 +486,8 @@ class ContainerCollection(Collection):
             cpu_shares (int): CPU shares (relative weight).
             cpuset_cpus (str): CPUs in which to allow execution (``0-3``,
                 ``0,1``).
+            cpuset_mems (str): Memory nodes (MEMs) in which to allow execution
+                (``0-3``, ``0,1``). Only effective on NUMA systems.
             detach (bool): Run container in the background and return a
                 :py:class:`Container` object.
             device_read_bps: Limit read rate (bytes per second) from a device
@@ -829,6 +834,7 @@ RUN_HOST_CONFIG_KWARGS = [
     'cpu_quota',
     'cpu_shares',
     'cpuset_cpus',
+    'cpuset_mems',
     'device_read_bps',
     'device_read_iops',
     'device_write_bps',
