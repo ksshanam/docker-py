@@ -147,7 +147,7 @@ class Container(Model):
 
         Returns:
             (generator or str): If ``stream=True``, a generator yielding
-            response chunks. A string containing response data otherwise.
+                response chunks. A string containing response data otherwise.
 
         Raises:
             :py:class:`docker.errors.APIError`
@@ -516,6 +516,8 @@ class ContainerCollection(Collection):
                 container, as a mapping of hostname to IP address.
             group_add (:py:class:`list`): List of additional group names and/or
                 IDs that the container process will run as.
+            healthcheck (dict): Specify a test to perform to check that the
+                container is healthy.
             hostname (str): Optional hostname for the container.
             init (bool): Run an init inside the container that forwards
                 signals and reaps processes
@@ -546,10 +548,12 @@ class ContainerCollection(Collection):
                 behavior. Accepts number between 0 and 100.
             memswap_limit (str or int): Maximum amount of memory + swap a
                 container is allowed to consume.
-            networks (:py:class:`list`): A list of network names to connect
-                this container to.
             name (str): The name for this container.
             nano_cpus (int):  CPU quota in units of 10-9 CPUs.
+            network (str): Name of the network this container will be connected
+                to at creation time. You can connect to additional networks
+                using :py:meth:`Network.connect`. Incompatible with
+                ``network_mode``.
             network_disabled (bool): Disable networking.
             network_mode (str): One of:
 
@@ -559,6 +563,7 @@ class ContainerCollection(Collection):
                 - ``container:<name|id>`` Reuse another container's network
                   stack.
                 - ``host`` Use the host network stack.
+                Incompatible with ``network``.
             oom_kill_disable (bool): Whether to disable OOM killer.
             oom_score_adj (int): An integer value containing the score given
                 to the container in order to tune OOM killer preferences.
@@ -656,6 +661,7 @@ class ContainerCollection(Collection):
             volumes_from (:py:class:`list`): List of container names or IDs to
                 get volumes from.
             working_dir (str): Path to the working directory.
+            runtime (str): Runtime to use with this container.
 
         Returns:
             The container logs, either ``STDOUT``, ``STDERR``, or both,
@@ -679,6 +685,12 @@ class ContainerCollection(Collection):
         if detach and remove:
             raise RuntimeError("The options 'detach' and 'remove' cannot be "
                                "used together.")
+
+        if kwargs.get('network') and kwargs.get('network_mode'):
+            raise RuntimeError(
+                'The options "network" and "network_mode" can not be used '
+                'together.'
+            )
 
         try:
             container = self.create(image=image, command=command,
@@ -876,6 +888,7 @@ RUN_HOST_CONFIG_KWARGS = [
     'userns_mode',
     'version',
     'volumes_from',
+    'runtime'
 ]
 
 
@@ -902,10 +915,10 @@ def _create_container_args(kwargs):
     if volumes:
         host_config_kwargs['binds'] = volumes
 
-    networks = kwargs.pop('networks', [])
-    if networks:
-        create_kwargs['networking_config'] = {network: None
-                                              for network in networks}
+    network = kwargs.pop('network', None)
+    if network:
+        create_kwargs['networking_config'] = {network: None}
+        host_config_kwargs['network_mode'] = network
 
     # All kwargs should have been consumed by this point, so raise
     # error if any are left

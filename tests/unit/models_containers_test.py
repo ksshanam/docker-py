@@ -71,8 +71,7 @@ class ContainerCollectionTest(unittest.TestCase):
             memswap_limit=456,
             name='somename',
             network_disabled=False,
-            network_mode='blah',
-            networks=['foo'],
+            network='foo',
             oom_kill_disable=True,
             oom_score_adj=5,
             pid_mode='host',
@@ -153,7 +152,7 @@ class ContainerCollectionTest(unittest.TestCase):
                 'MemoryReservation': 123,
                 'MemorySwap': 456,
                 'MemorySwappiness': 2,
-                'NetworkMode': 'blah',
+                'NetworkMode': 'foo',
                 'OomKillDisable': True,
                 'OomScoreAdj': 5,
                 'PidMode': 'host',
@@ -227,7 +226,7 @@ class ContainerCollectionTest(unittest.TestCase):
         container = client.containers.run('alpine', 'sleep 300', detach=True)
 
         assert container.id == FAKE_CONTAINER_ID
-        client.api.pull.assert_called_with('alpine')
+        client.api.pull.assert_called_with('alpine', tag=None)
 
     def test_run_with_error(self):
         client = make_fake_client()
