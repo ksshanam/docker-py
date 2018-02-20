@@ -1,43 +1,92 @@
-import warnings
 from .. import auth, errors, utils
 from ..types import ServiceMode
 
 
-def _check_api_features(version, task_template, update_config):
+def _check_api_features(version, task_template, update_config, endpoint_spec):
+
+    def raise_version_error(param, min_version):
+        raise errors.InvalidVersion(
+            '{} is not supported in API version < {}'.format(
+                param, min_version
+            )
+        )
+
     if update_config is not None:
         if utils.version_lt(version, '1.25'):
             if 'MaxFailureRatio' in update_config:
-                raise errors.InvalidVersion(
-                    'UpdateConfig.max_failure_ratio is not supported in'
-                    ' API version < 1.25'
-                )
+                raise_version_error('UpdateConfig.max_failure_ratio', '1.25')
             if 'Monitor' in update_config:
-                raise errors.InvalidVersion(
-                    'UpdateConfig.monitor is not supported in'
-                    ' API version < 1.25'
-                )
+                raise_version_error('UpdateConfig.monitor', '1.25')
+
+        if utils.version_lt(version, '1.29'):
+            if 'Order' in update_config:
+                raise_version_error('UpdateConfig.order', '1.29')
+
+    if endpoint_spec is not None:
+        if utils.version_lt(version, '1.32') and 'Ports' in endpoint_spec:
+            if any(p.get('PublishMode') for p in endpoint_spec['Ports']):
+                raise_version_error('EndpointSpec.Ports[].mode', '1.32')
 
     if task_template is not None:
         if 'ForceUpdate' in task_template and utils.version_lt(
                 version, '1.25'):
-            raise errors.InvalidVersion(
-                'force_update is not supported in API version < 1.25'
-            )
+                raise_version_error('force_update', '1.25')
 
         if task_template.get('Placement'):
             if utils.version_lt(version, '1.30'):
                 if task_template['Placement'].get('Platforms'):
-                    raise errors.InvalidVersion(
-                        'Placement.platforms is not supported in'
-                        ' API version < 1.30'
-                    )
-
+                    raise_version_error('Placement.platforms', '1.30')
             if utils.version_lt(version, '1.27'):
                 if task_template['Placement'].get('Preferences'):
-                    raise errors.InvalidVersion(
-                        'Placement.preferences is not supported in'
-                        ' API version < 1.27'
-                    )
+                    raise_version_error('Placement.preferences', '1.27')
+
+        if task_template.get('ContainerSpec'):
+            container_spec = task_template.get('ContainerSpec')
+
+            if utils.version_lt(version, '1.25'):
+                if container_spec.get('TTY'):
+                    raise_version_error('ContainerSpec.tty', '1.25')
+                if container_spec.get('Hostname') is not None:
+                    raise_version_error('ContainerSpec.hostname', '1.25')
+                if container_spec.get('Hosts') is not None:
+                    raise_version_error('ContainerSpec.hosts', '1.25')
+                if container_spec.get('Groups') is not None:
+                    raise_version_error('ContainerSpec.groups', '1.25')
+                if container_spec.get('DNSConfig') is not None:
+                    raise_version_error('ContainerSpec.dns_config', '1.25')
+                if container_spec.get('Healthcheck') is not None:
+                    raise_version_error('ContainerSpec.healthcheck', '1.25')
+
+            if utils.version_lt(version, '1.28'):
+                if container_spec.get('ReadOnly') is not None:
+                    raise_version_error('ContainerSpec.dns_config', '1.28')
+                if container_spec.get('StopSignal') is not None:
+                    raise_version_error('ContainerSpec.stop_signal', '1.28')
+
+            if utils.version_lt(version, '1.30'):
+                if container_spec.get('Configs') is not None:
+                    raise_version_error('ContainerSpec.configs', '1.30')
+                if container_spec.get('Privileges') is not None:
+                    raise_version_error('ContainerSpec.privileges', '1.30')
+
+            if utils.version_lt(version, '1.35'):
+                if container_spec.get('Isolation') is not None:
+                    raise_version_error('ContainerSpec.isolation', '1.35')
+
+
+def _merge_task_template(current, override):
+    merged = current.copy()
+    if override is not None:
+        for ts_key, ts_value in override.items():
+            if ts_key == 'ContainerSpec':
+                if 'ContainerSpec' not in merged:
+                    merged['ContainerSpec'] = {}
+                for cs_key, cs_value in override['ContainerSpec'].items():
+                    if cs_value is not None:
+                        merged['ContainerSpec'][cs_key] = cs_value
+            elif ts_value is not None:
+                merged[ts_key] = ts_value
+    return merged
 
 
 class ServiceApiMixin(object):
@@ -73,14 +122,10 @@ class ServiceApiMixin(object):
             :py:class:`docker.errors.APIError`
                 If the server returns an error.
         """
-        if endpoint_config is not None:
-            warnings.warn(
-                'endpoint_config has been renamed to endpoint_spec.',
-                DeprecationWarning
-            )
-            endpoint_spec = endpoint_config
 
-        _check_api_features(self._version, task_template, update_config)
+        _check_api_features(
+            self._version, task_template, update_config, endpoint_spec
+        )
 
         url = self._url('/services/create')
         headers = {}
@@ -96,6 +141,8 @@ class ServiceApiMixin(object):
         auth_header = auth.get_config_header(self, registry)
         if auth_header:
             headers['X-Registry-Auth'] = auth_header
+        if utils.version_lt(self._version, '1.25'):
+            networks = networks or task_template.pop('Networks', None)
         data = {
             'Name': name,
             'Labels': labels,
@@ -114,12 +161,14 @@ class ServiceApiMixin(object):
 
     @utils.minimum_version('1.24')
     @utils.check_resource('service')
-    def inspect_service(self, service):
+    def inspect_service(self, service, insert_defaults=None):
         """
         Return information about a service.
 
         Args:
-            service (str): Service name or ID
+            service (str): Service name or ID.
+            insert_defaults (boolean): If true, default values will be merged
+                into the service inspect output.
 
         Returns:
             ``True`` if successful.
@@ -129,7 +178,15 @@ class ServiceApiMixin(object):
                 If the server returns an error.
         """
         url = self._url('/services/{0}', service)
-        return self._result(self._get(url), True)
+        params = {}
+        if insert_defaults is not None:
+            if utils.version_lt(self._version, '1.29'):
+                raise errors.InvalidVersion(
+                    'insert_defaults is not supported in API version < 1.29'
+                )
+            params['insertDefaults'] = insert_defaults
+
+        return self._result(self._get(url, params=params), True)
 
     @utils.minimum_version('1.24')
     @utils.check_resource('task')
@@ -179,7 +236,8 @@ class ServiceApiMixin(object):
 
         Args:
             filters (dict): Filters to process on the nodes list. Valid
-                filters: ``id`` and ``name``. Default: ``None``.
+                filters: ``id``, ``name`` , ``label`` and ``mode``.
+                Default: ``None``.
 
         Returns:
             A list of dictionaries containing data about each service.
@@ -273,7 +331,7 @@ class ServiceApiMixin(object):
     def update_service(self, service, version, task_template=None, name=None,
                        labels=None, mode=None, update_config=None,
                        networks=None, endpoint_config=None,
-                       endpoint_spec=None):
+                       endpoint_spec=None, fetch_current_spec=False):
         """
         Update a service.
 
@@ -295,6 +353,8 @@ class ServiceApiMixin(object):
                 the service to. Default: ``None``.
             endpoint_spec (EndpointSpec): Properties that can be configured to
                 access and load balance a service. Default: ``None``.
+            fetch_current_spec (boolean): Use the undefined settings from the
+                current specification of the service. Default: ``False``
 
         Returns:
             ``True`` if successful.
@@ -303,41 +363,74 @@ class ServiceApiMixin(object):
             :py:class:`docker.errors.APIError`
                 If the server returns an error.
         """
-        if endpoint_config is not None:
-            warnings.warn(
-                'endpoint_config has been renamed to endpoint_spec.',
-                DeprecationWarning
-            )
-            endpoint_spec = endpoint_config
 
-        _check_api_features(self._version, task_template, update_config)
+        _check_api_features(
+            self._version, task_template, update_config, endpoint_spec
+        )
+
+        if fetch_current_spec:
+            inspect_defaults = True
+            if utils.version_lt(self._version, '1.29'):
+                inspect_defaults = None
+            current = self.inspect_service(
+                service, insert_defaults=inspect_defaults
+            )['Spec']
+
+        else:
+            current = {}
 
         url = self._url('/services/{0}/update', service)
         data = {}
         headers = {}
-        if name is not None:
-            data['Name'] = name
-        if labels is not None:
-            data['Labels'] = labels
+
+        data['Name'] = current.get('Name') if name is None else name
+
+        data['Labels'] = current.get('Labels') if labels is None else labels
+
         if mode is not None:
             if not isinstance(mode, dict):
                 mode = ServiceMode(mode)
             data['Mode'] = mode
-        if task_template is not None:
-            image = task_template.get('ContainerSpec', {}).get('Image', None)
-            if image is not None:
-                registry, repo_name = auth.resolve_repository_name(image)
-                auth_header = auth.get_config_header(self, registry)
-                if auth_header:
-                    headers['X-Registry-Auth'] = auth_header
-            data['TaskTemplate'] = task_template
+        else:
+            data['Mode'] = current.get('Mode')
+
+        data['TaskTemplate'] = _merge_task_template(
+            current.get('TaskTemplate', {}), task_template
+        )
+
+        container_spec = data['TaskTemplate'].get('ContainerSpec', {})
+        image = container_spec.get('Image', None)
+        if image is not None:
+            registry, repo_name = auth.resolve_repository_name(image)
+            auth_header = auth.get_config_header(self, registry)
+            if auth_header:
+                headers['X-Registry-Auth'] = auth_header
+
         if update_config is not None:
             data['UpdateConfig'] = update_config
+        else:
+            data['UpdateConfig'] = current.get('UpdateConfig')
 
         if networks is not None:
-            data['Networks'] = utils.convert_service_networks(networks)
+            converted_networks = utils.convert_service_networks(networks)
+            if utils.version_lt(self._version, '1.25'):
+                data['Networks'] = converted_networks
+            else:
+                data['TaskTemplate']['Networks'] = converted_networks
+        elif utils.version_lt(self._version, '1.25'):
+            data['Networks'] = current.get('Networks')
+        elif data['TaskTemplate'].get('Networks') is None:
+            current_task_template = current.get('TaskTemplate', {})
+            current_networks = current_task_template.get('Networks')
+            if current_networks is None:
+                current_networks = current.get('Networks')
+            if current_networks is not None:
+                data['TaskTemplate']['Networks'] = current_networks
+
         if endpoint_spec is not None:
             data['EndpointSpec'] = endpoint_spec
+        else:
+            data['EndpointSpec'] = current.get('EndpointSpec')
 
         resp = self._post_json(
             url, data=data, params={'version': version}, headers=headers

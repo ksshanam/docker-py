@@ -5,9 +5,7 @@ def imageNamePy2
 def imageNamePy3
 def images = [:]
 
-// Note: Swarm in dind seem notoriously flimsy with 1.12.1+, which is why we're
-// sticking with 1.12.0 for the 1.12 series
-def dockerVersions = ["1.12.0", "1.13.1", "17.04.0-ce", "17.05.0-ce"]
+def dockerVersions = ["17.06.2-ce", "17.12.0-ce", "18.01.0-ce"]
 
 def buildImage = { name, buildargs, pyTag ->
   img = docker.image(name)
@@ -29,13 +27,13 @@ def buildImages = { ->
       imageNamePy3 = "${imageNameBase}:py3-${gitCommit()}"
 
       buildImage(imageNamePy2, ".", "py2.7")
-      buildImage(imageNamePy3, "-f Dockerfile-py3 .", "py3.5")
+      buildImage(imageNamePy3, "-f Dockerfile-py3 .", "py3.6")
     }
   }
 }
 
 def getAPIVersion = { engineVersion ->
-  def versionMap = ['1.12.': '1.24', '1.13.': '1.26', '17.04': '1.27', '17.05': '1.29']
+  def versionMap = ['17.06': '1.30', '17.12': '1.35', '18.01': '1.35']
   return versionMap[engineVersion.substring(0, 5)]
 }
 
@@ -63,7 +61,7 @@ def runTests = { Map settings ->
         def testContainerName = "dpy-tests-\$BUILD_NUMBER-\$EXECUTOR_NUMBER-${pythonVersion}-${dockerVersion}"
         try {
           sh """docker run -d --name  ${dindContainerName} -v /tmp --privileged \\
-            dockerswarm/dind:${dockerVersion} docker daemon -H tcp://0.0.0.0:2375
+            dockerswarm/dind:${dockerVersion} dockerd -H tcp://0.0.0.0:2375
           """
           sh """docker run \\
             --name ${testContainerName} --volumes-from ${dindContainerName} \\

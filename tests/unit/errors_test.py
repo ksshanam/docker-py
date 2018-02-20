@@ -2,8 +2,11 @@ import unittest
 
 import requests
 
-from docker.errors import (APIError, DockerException,
-                           create_unexpected_kwargs_error)
+from docker.errors import (APIError, ContainerError, DockerException,
+                           create_unexpected_kwargs_error,
+                           create_api_error_from_http_exception)
+from .fake_api import FAKE_CONTAINER_ID, FAKE_IMAGE_ID
+from .fake_api_client import make_fake_client
 
 
 class APIErrorTest(unittest.TestCase):
@@ -75,6 +78,49 @@ class APIErrorTest(unittest.TestCase):
         resp.status_code = 400
         err = APIError('', response=resp)
         assert err.is_client_error() is True
+
+    def test_create_error_from_exception(self):
+            resp = requests.Response()
+            resp.status_code = 500
+            err = APIError('')
+            try:
+                resp.raise_for_status()
+            except requests.exceptions.HTTPError as e:
+                try:
+                    create_api_error_from_http_exception(e)
+                except APIError as e:
+                    err = e
+            assert err.is_server_error() is True
+
+
+class ContainerErrorTest(unittest.TestCase):
+    def test_container_without_stderr(self):
+        """The massage does not contain stderr"""
+        client = make_fake_client()
+        container = client.containers.get(FAKE_CONTAINER_ID)
+        command = "echo Hello World"
+        exit_status = 42
+        image = FAKE_IMAGE_ID
+        stderr = None
+
+        err = ContainerError(container, exit_status, command, image, stderr)
+        msg = ("Command '{}' in image '{}' returned non-zero exit status {}"
+               ).format(command, image, exit_status, stderr)
+        assert str(err) == msg
+
+    def test_container_with_stderr(self):
+        """The massage contains stderr"""
+        client = make_fake_client()
+        container = client.containers.get(FAKE_CONTAINER_ID)
+        command = "echo Hello World"
+        exit_status = 42
+        image = FAKE_IMAGE_ID
+        stderr = "Something went wrong"
+
+        err = ContainerError(container, exit_status, command, image, stderr)
+        msg = ("Command '{}' in image '{}' returned non-zero exit status {}: "
+               "{}").format(command, image, exit_status, stderr)
+        assert str(err) == msg
 
 
 class CreateUnexpectedKwargsErrorTest(unittest.TestCase):

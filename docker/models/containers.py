@@ -1,9 +1,13 @@
 import copy
+import ntpath
+from collections import namedtuple
 
 from ..api import APIClient
+from ..constants import DEFAULT_DATA_CHUNK_SIZE
 from ..errors import (ContainerError, ImageNotFound,
                       create_unexpected_kwargs_error)
 from ..types import HostConfig
+from ..utils import version_gte
 from .images import Image
 from .resource import Collection, Model
 
@@ -125,7 +129,7 @@ class Container(Model):
 
     def exec_run(self, cmd, stdout=True, stderr=True, stdin=False, tty=False,
                  privileged=False, user='', detach=False, stream=False,
-                 socket=False, environment=None):
+                 socket=False, environment=None, workdir=None):
         """
         Run a command inside this container. Similar to
         ``docker exec``.
@@ -141,13 +145,22 @@ class Container(Model):
             detach (bool): If true, detach from the exec command.
                 Default: False
             stream (bool): Stream response data. Default: False
+            socket (bool): Return the connection socket to allow custom
+                read/write operations. Default: False
             environment (dict or list): A dictionary or a list of strings in
                 the following format ``["PASSWORD=xxx"]`` or
                 ``{"PASSWORD": "xxx"}``.
+            workdir (str): Path to working directory for this exec session
 
         Returns:
-            (generator or str): If ``stream=True``, a generator yielding
-                response chunks. A string containing response data otherwise.
+            (ExecResult): A tuple of (exit_code, output)
+                exit_code: (int):
+                    Exit code for the executed command or ``None`` if
+                    either ``stream```or ``socket`` is ``True``.
+                output: (generator or str):
+                    If ``stream=True``, a generator yielding response chunks.
+                    If ``socket=True``, a socket object for the connection.
+                    A string containing response data otherwise.
 
         Raises:
             :py:class:`docker.errors.APIError`
@@ -155,15 +168,28 @@ class Container(Model):
         """
         resp = self.client.api.exec_create(
             self.id, cmd, stdout=stdout, stderr=stderr, stdin=stdin, tty=tty,
-            privileged=privileged, user=user, environment=environment
+            privileged=privileged, user=user, environment=environment,
+            workdir=workdir
         )
-        return self.client.api.exec_start(
+        exec_output = self.client.api.exec_start(
             resp['Id'], detach=detach, tty=tty, stream=stream, socket=socket
         )
+        if socket or stream:
+            return ExecResult(None, exec_output)
 
-    def export(self):
+        return ExecResult(
+            self.client.api.exec_inspect(resp['Id'])['ExitCode'],
+            exec_output
+        )
+
+    def export(self, chunk_size=DEFAULT_DATA_CHUNK_SIZE):
         """
         Export the contents of the container's filesystem as a tar archive.
+
+        Args:
+            chunk_size (int): The number of bytes returned by each iteration
+                of the generator. If ``None``, data will be streamed as it is
+                received. Default: 2 MB
 
         Returns:
             (str): The filesystem tar archive
@@ -172,15 +198,18 @@ class Container(Model):
             :py:class:`docker.errors.APIError`
                 If the server returns an error.
         """
-        return self.client.api.export(self.id)
+        return self.client.api.export(self.id, chunk_size)
 
-    def get_archive(self, path):
+    def get_archive(self, path, chunk_size=DEFAULT_DATA_CHUNK_SIZE):
         """
         Retrieve a file or folder from the container in the form of a tar
         archive.
 
         Args:
             path (str): Path to the file or folder to retrieve
+            chunk_size (int): The number of bytes returned by each iteration
+                of the generator. If ``None``, data will be streamed as it is
+                received. Default: 2 MB
 
         Returns:
             (tuple): First element is a raw tar data stream. Second element is
@@ -190,7 +219,7 @@ class Container(Model):
             :py:class:`docker.errors.APIError`
                 If the server returns an error.
         """
-        return self.client.api.get_archive(self.id, path)
+        return self.client.api.get_archive(self.id, path, chunk_size)
 
     def kill(self, signal=None):
         """
@@ -224,6 +253,8 @@ class Container(Model):
             since (datetime or int): Show logs since a given datetime or
                 integer epoch (in seconds)
             follow (bool): Follow log output
+            until (datetime or int): Show logs that occurred before the given
+                datetime or integer epoch (in seconds)
 
         Returns:
             (generator or str): Logs from the container.
@@ -423,10 +454,13 @@ class Container(Model):
 
         Args:
             timeout (int): Request timeout
+            condition (str): Wait until a container state reaches the given
+                condition, either ``not-running`` (default), ``next-exit``,
+                or ``removed``
 
         Returns:
-            (int): The exit code of the container. Returns ``-1`` if the API
-            responds without a ``StatusCode`` attribute.
+            (dict): The API's response as a Python dictionary, including
+                the container's exit code under the ``StatusCode`` attribute.
 
         Raises:
             :py:class:`requests.exceptions.ReadTimeout`
@@ -490,6 +524,8 @@ class ContainerCollection(Collection):
                 (``0-3``, ``0,1``). Only effective on NUMA systems.
             detach (bool): Run container in the background and return a
                 :py:class:`Container` object.
+            device_cgroup_rules (:py:class:`list`): A list of cgroup rules to
+                apply to the container.
             device_read_bps: Limit read rate (bytes per second) from a device
                 in the form of: `[{"Path": "device_path", "Rate": rate}]`
             device_read_iops: Limit read rate (IO per second) from a device.
@@ -548,8 +584,12 @@ class ContainerCollection(Collection):
                 behavior. Accepts number between 0 and 100.
             memswap_limit (str or int): Maximum amount of memory + swap a
                 container is allowed to consume.
+            mounts (:py:class:`list`): Specification for mounts to be added to
+                the container. More powerful alternative to ``volumes``. Each
+                item in the list is expected to be a
+                :py:class:`docker.types.Mount` object.
             name (str): The name for this container.
-            nano_cpus (int):  CPU quota in units of 10-9 CPUs.
+            nano_cpus (int):  CPU quota in units of 1e-9 CPUs.
             network (str): Name of the network this container will be connected
                 to at creation time. You can connect to additional networks
                 using :py:meth:`Network.connect`. Incompatible with
@@ -563,6 +603,7 @@ class ContainerCollection(Collection):
                 - ``container:<name|id>`` Reuse another container's network
                   stack.
                 - ``host`` Use the host network stack.
+
                 Incompatible with ``network``.
             oom_kill_disable (bool): Whether to disable OOM killer.
             oom_score_adj (int): An integer value containing the score given
@@ -571,6 +612,8 @@ class ContainerCollection(Collection):
                 inside the container.
             pids_limit (int): Tune a container's pids limit. Set ``-1`` for
                 unlimited.
+            platform (str): Platform in the format ``os[/arch[/variant]]``.
+                Only used if the method needs to pull the requested image.
             ports (dict): Ports to bind inside the container.
 
                 The keys of the dictionary are the ports to bind inside the
@@ -621,6 +664,9 @@ class ContainerCollection(Collection):
                 (e.g. ``SIGINT``).
             storage_opt (dict): Storage driver options per container as a
                 key-value mapping.
+            stream (bool): If true and ``detach`` is false, return a log
+                generator instead of a string. Ignored if ``detach`` is true.
+                Default: ``False``.
             sysctls (dict): Kernel parameters to set in the container.
             tmpfs (dict): Temporary filesystems to mount, as a dictionary
                 mapping a path inside the container to options for that path.
@@ -667,6 +713,13 @@ class ContainerCollection(Collection):
             The container logs, either ``STDOUT``, ``STDERR``, or both,
             depending on the value of the ``stdout`` and ``stderr`` arguments.
 
+            ``STDOUT`` and ``STDERR`` may be read only if either ``json-file``
+            or ``journald`` logging driver used. Thus, if you are using none of
+            these drivers, a ``None`` object is returned instead. See the
+            `Engine API documentation
+            <https://docs.docker.com/engine/api/v1.30/#operation/ContainerLogs/>`_
+            for full details.
+
             If ``detach`` is ``True``, a :py:class:`Container` object is
             returned instead.
 
@@ -681,10 +734,16 @@ class ContainerCollection(Collection):
         """
         if isinstance(image, Image):
             image = image.id
-        detach = kwargs.pop("detach", False)
+        stream = kwargs.pop('stream', False)
+        detach = kwargs.pop('detach', False)
+        platform = kwargs.pop('platform', None)
+
         if detach and remove:
-            raise RuntimeError("The options 'detach' and 'remove' cannot be "
-                               "used together.")
+            if version_gte(self.client.api._version, '1.25'):
+                kwargs["auto_remove"] = True
+            else:
+                raise RuntimeError("The options 'detach' and 'remove' cannot "
+                                   "be used together in api versions < 1.25.")
 
         if kwargs.get('network') and kwargs.get('network_mode'):
             raise RuntimeError(
@@ -696,7 +755,7 @@ class ContainerCollection(Collection):
             container = self.create(image=image, command=command,
                                     detach=detach, **kwargs)
         except ImageNotFound:
-            self.client.images.pull(image)
+            self.client.images.pull(image, platform=platform)
             container = self.create(image=image, command=command,
                                     detach=detach, **kwargs)
 
@@ -705,16 +764,30 @@ class ContainerCollection(Collection):
         if detach:
             return container
 
-        exit_status = container.wait()
+        logging_driver = container.attrs['HostConfig']['LogConfig']['Type']
+
+        out = None
+        if logging_driver == 'json-file' or logging_driver == 'journald':
+            out = container.logs(
+                stdout=stdout, stderr=stderr, stream=True, follow=True
+            )
+
+        exit_status = container.wait()['StatusCode']
         if exit_status != 0:
-            stdout = False
-            stderr = True
-        out = container.logs(stdout=stdout, stderr=stderr)
+            out = None
+            if not kwargs.get('auto_remove'):
+                out = container.logs(stdout=False, stderr=True)
+
         if remove:
             container.remove()
         if exit_status != 0:
-            raise ContainerError(container, exit_status, command, image, out)
-        return out
+            raise ContainerError(
+                container, exit_status, command, image, out
+            )
+
+        return out if stream or out is None else b''.join(
+            [line for line in out]
+        )
 
     def create(self, image, command=None, **kwargs):
         """
@@ -835,6 +908,7 @@ RUN_CREATE_KWARGS = [
 
 # kwargs to copy straight from run to host_config
 RUN_HOST_CONFIG_KWARGS = [
+    'auto_remove',
     'blkio_weight_device',
     'blkio_weight',
     'cap_add',
@@ -847,6 +921,9 @@ RUN_HOST_CONFIG_KWARGS = [
     'cpu_shares',
     'cpuset_cpus',
     'cpuset_mems',
+    'cpu_rt_period',
+    'cpu_rt_runtime',
+    'device_cgroup_rules',
     'device_read_bps',
     'device_read_iops',
     'device_write_bps',
@@ -869,6 +946,7 @@ RUN_HOST_CONFIG_KWARGS = [
     'mem_reservation',
     'mem_swappiness',
     'memswap_limit',
+    'mounts',
     'nano_cpus',
     'network_mode',
     'oom_kill_disable',
@@ -933,17 +1011,27 @@ def _create_container_args(kwargs):
         # sort to make consistent for tests
         create_kwargs['ports'] = [tuple(p.split('/', 1))
                                   for p in sorted(port_bindings.keys())]
-    binds = create_kwargs['host_config'].get('Binds')
-    if binds:
-        create_kwargs['volumes'] = [_host_volume_from_bind(v) for v in binds]
+    if volumes:
+        if isinstance(volumes, dict):
+            create_kwargs['volumes'] = [
+                v.get('bind') for v in volumes.values()
+            ]
+        else:
+            create_kwargs['volumes'] = [
+                _host_volume_from_bind(v) for v in volumes
+            ]
     return create_kwargs
 
 
 def _host_volume_from_bind(bind):
-    bits = bind.split(':')
-    if len(bits) == 1:
-        return bits[0]
-    elif len(bits) == 2 and bits[1] in ('ro', 'rw'):
-        return bits[0]
+    drive, rest = ntpath.splitdrive(bind)
+    bits = rest.split(':', 1)
+    if len(bits) == 1 or bits[1] in ('ro', 'rw'):
+        return drive + bits[0]
     else:
-        return bits[1]
+        return bits[1].rstrip(':ro').rstrip(':rw')
+
+
+ExecResult = namedtuple('ExecResult', 'exit_code,output')
+""" A result of Container.exec_run with the properties ``exit_code`` and
+    ``output``. """

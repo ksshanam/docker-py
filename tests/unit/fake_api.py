@@ -21,21 +21,36 @@ FAKE_NODE_ID = '24ifsmvkjbyhk'
 # for clarity and readability
 
 
-def get_fake_raw_version():
-    status_code = 200
-    response = {
-        "ApiVersion": "1.18",
-        "GitCommit": "fake-commit",
-        "GoVersion": "go1.3.3",
-        "Version": "1.5.0"
-    }
-    return status_code, response
-
-
 def get_fake_version():
     status_code = 200
-    response = {'GoVersion': '1', 'Version': '1.1.1',
-                'GitCommit': 'deadbeef+CHANGES'}
+    response = {
+        'ApiVersion': '1.35',
+        'Arch': 'amd64',
+        'BuildTime': '2018-01-10T20:09:37.000000000+00:00',
+        'Components': [{
+            'Details': {
+                'ApiVersion': '1.35',
+                'Arch': 'amd64',
+                'BuildTime': '2018-01-10T20:09:37.000000000+00:00',
+                'Experimental': 'false',
+                'GitCommit': '03596f5',
+                'GoVersion': 'go1.9.2',
+                'KernelVersion': '4.4.0-112-generic',
+                'MinAPIVersion': '1.12',
+                'Os': 'linux'
+            },
+            'Name': 'Engine',
+            'Version': '18.01.0-ce'
+        }],
+        'GitCommit': '03596f5',
+        'GoVersion': 'go1.9.2',
+        'KernelVersion': '4.4.0-112-generic',
+        'MinAPIVersion': '1.12',
+        'Os': 'linux',
+        'Platform': {'Name': ''},
+        'Version': '18.01.0-ce'
+    }
+
     return status_code, response
 
 
@@ -146,6 +161,12 @@ def get_fake_inspect_container(tty=False):
             "StartedAt": "2013-09-25T14:01:18.869545111+02:00",
             "Ghost": False
         },
+        "HostConfig": {
+            "LogConfig": {
+                "Type": "json-file",
+                "Config": {}
+            },
+        },
         "MacAddress": "02:42:ac:11:00:0a"
     }
     return status_code, response
@@ -199,7 +220,9 @@ def get_fake_wait():
 
 def get_fake_logs():
     status_code = 200
-    response = (b'\x01\x00\x00\x00\x00\x00\x00\x11Flowering Nights\n'
+    response = (b'\x01\x00\x00\x00\x00\x00\x00\x00'
+                b'\x02\x00\x00\x00\x00\x00\x00\x00'
+                b'\x01\x00\x00\x00\x00\x00\x00\x11Flowering Nights\n'
                 b'\x01\x00\x00\x00\x00\x00\x00\x10(Sakuya Iyazoi)\n')
     return status_code, response
 
@@ -429,6 +452,10 @@ def post_fake_update_node():
     return 200, None
 
 
+def post_fake_join_swarm():
+    return 200, None
+
+
 def get_fake_network_list():
     return 200, [{
         "Name": "bridge",
@@ -491,7 +518,7 @@ if constants.IS_WINDOWS_PLATFORM:
 
 fake_responses = {
     '{0}/version'.format(prefix):
-    get_fake_raw_version,
+    get_fake_version,
     '{1}/{0}/version'.format(CURRENT_VERSION, prefix):
     get_fake_version,
     '{1}/{0}/info'.format(CURRENT_VERSION, prefix):
@@ -593,6 +620,8 @@ fake_responses = {
         CURRENT_VERSION, prefix, FAKE_NODE_ID
     ), 'POST'):
     post_fake_update_node,
+    ('{1}/{0}/swarm/join'.format(CURRENT_VERSION, prefix), 'POST'):
+    post_fake_join_swarm,
     ('{1}/{0}/networks'.format(CURRENT_VERSION, prefix), 'GET'):
     get_fake_network_list,
     ('{1}/{0}/networks/create'.format(CURRENT_VERSION, prefix), 'POST'):

@@ -6,11 +6,9 @@ import json
 import shlex
 import tarfile
 import tempfile
-import warnings
 from distutils.version import StrictVersion
 from datetime import datetime
 
-import requests
 import six
 
 from .. import constants
@@ -97,23 +95,33 @@ def create_archive(root, files=None, fileobj=None, gzip=False):
     if files is None:
         files = build_file_list(root)
     for path in files:
-        i = t.gettarinfo(os.path.join(root, path), arcname=path)
+        full_path = os.path.join(root, path)
+
+        i = t.gettarinfo(full_path, arcname=path)
         if i is None:
             # This happens when we encounter a socket file. We can safely
             # ignore it and proceed.
             continue
+
+        # Workaround https://bugs.python.org/issue32713
+        if i.mtime < 0 or i.mtime > 8**11 - 1:
+            i.mtime = int(i.mtime)
 
         if constants.IS_WINDOWS_PLATFORM:
             # Windows doesn't keep track of the execute bit, so we make files
             # and directories executable by default.
             i.mode = i.mode & 0o755 | 0o111
 
-        try:
-            # We open the file object in binary mode for Windows support.
-            with open(os.path.join(root, path), 'rb') as f:
-                t.addfile(i, f)
-        except IOError:
-            # When we encounter a directory the file object is set to None.
+        if i.isfile():
+            try:
+                with open(full_path, 'rb') as f:
+                    t.addfile(i, f)
+            except IOError:
+                raise IOError(
+                    'Can not read file in context: {}'.format(full_path)
+                )
+        else:
+            # Directories, FIFOs, symlinks... don't need to be read.
             t.addfile(i, None)
     t.close()
     fileobj.seek(0)
@@ -148,29 +156,6 @@ def version_lt(v1, v2):
 
 def version_gte(v1, v2):
     return not version_lt(v1, v2)
-
-
-def ping_registry(url):
-    warnings.warn(
-        'The `ping_registry` method is deprecated and will be removed.',
-        DeprecationWarning
-    )
-
-    return ping(url + '/v2/', [401]) or ping(url + '/v1/_ping')
-
-
-def ping(url, valid_4xx_statuses=None):
-    try:
-        res = requests.get(url, timeout=3)
-    except Exception:
-        return False
-    else:
-        # We don't send yet auth headers
-        # and a v2 registry will respond with status 401
-        return (
-            res.status_code < 400 or
-            (valid_4xx_statuses and res.status_code in valid_4xx_statuses)
-        )
 
 
 def _convert_port_binding(binding):
@@ -562,6 +547,18 @@ def format_environment(environment):
 
         return u'{key}={value}'.format(key=key, value=value)
     return [format_env(*var) for var in six.iteritems(environment)]
+
+
+def format_extra_hosts(extra_hosts, task=False):
+    # Use format dictated by Swarm API if container is part of a task
+    if task:
+        return [
+            '{} {}'.format(v, k) for k, v in sorted(six.iteritems(extra_hosts))
+        ]
+
+    return [
+        '{}:{}'.format(k, v) for k, v in sorted(six.iteritems(extra_hosts))
+    ]
 
 
 def create_host_config(self, *args, **kwargs):

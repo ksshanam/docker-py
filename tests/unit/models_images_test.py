@@ -1,3 +1,4 @@
+from docker.constants import DEFAULT_DATA_CHUNK_SIZE
 from docker.models.images import Image
 import unittest
 
@@ -41,9 +42,22 @@ class ImageCollectionTest(unittest.TestCase):
 
     def test_pull(self):
         client = make_fake_client()
-        image = client.images.pull('test_image')
+        image = client.images.pull('test_image:latest')
+        client.api.pull.assert_called_with('test_image', tag='latest')
+        client.api.inspect_image.assert_called_with('test_image:latest')
+        assert isinstance(image, Image)
+        assert image.id == FAKE_IMAGE_ID
+
+    def test_pull_multiple(self):
+        client = make_fake_client()
+        images = client.images.pull('test_image')
         client.api.pull.assert_called_with('test_image', tag=None)
-        client.api.inspect_image.assert_called_with('test_image')
+        client.api.images.assert_called_with(
+            all=False, name='test_image', filters=None
+        )
+        client.api.inspect_image.assert_called_with(FAKE_IMAGE_ID)
+        assert len(images) == 1
+        image = images[0]
         assert isinstance(image, Image)
         assert image.id == FAKE_IMAGE_ID
 
@@ -103,7 +117,9 @@ class ImageTest(unittest.TestCase):
         client = make_fake_client()
         image = client.images.get(FAKE_IMAGE_ID)
         image.save()
-        client.api.get_image.assert_called_with(FAKE_IMAGE_ID)
+        client.api.get_image.assert_called_with(
+            FAKE_IMAGE_ID, DEFAULT_DATA_CHUNK_SIZE
+        )
 
     def test_tag(self):
         client = make_fake_client()

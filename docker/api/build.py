@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import re
 
 from .. import auth
 from .. import constants
@@ -14,11 +13,12 @@ log = logging.getLogger(__name__)
 
 class BuildApiMixin(object):
     def build(self, path=None, tag=None, quiet=False, fileobj=None,
-              nocache=False, rm=False, stream=False, timeout=None,
+              nocache=False, rm=False, timeout=None,
               custom_context=False, encoding=None, pull=False,
               forcerm=False, dockerfile=None, container_limits=None,
               decode=False, buildargs=None, gzip=False, shmsize=None,
-              labels=None, cache_from=None, target=None, network_mode=None):
+              labels=None, cache_from=None, target=None, network_mode=None,
+              squash=None, extra_hosts=None, platform=None):
         """
         Similar to the ``docker build`` command. Either ``path`` or ``fileobj``
         needs to be set. ``path`` can be a local path (to a directory
@@ -66,9 +66,6 @@ class BuildApiMixin(object):
             rm (bool): Remove intermediate containers. The ``docker build``
                 command now defaults to ``--rm=true``, but we have kept the old
                 default of `False` to preserve backward compatibility
-            stream (bool): *Deprecated for API version > 1.8 (always True)*.
-                Return a blocking generator you can iterate over to retrieve
-                build output as it happens
             timeout (int): HTTP timeout
             custom_context (bool): Optional if using ``fileobj``
             encoding (str): The encoding for a stream. Set to ``gzip`` for
@@ -92,12 +89,17 @@ class BuildApiMixin(object):
             shmsize (int): Size of `/dev/shm` in bytes. The size must be
                 greater than 0. If omitted the system uses 64MB
             labels (dict): A dictionary of labels to set on the image
-            cache_from (list): A list of images used for build cache
-                resolution
+            cache_from (:py:class:`list`): A list of images used for build
+                cache resolution
             target (str): Name of the build-stage to build in a multi-stage
                 Dockerfile
             network_mode (str): networking mode for the run commands during
                 build
+            squash (bool): Squash the resulting images layers into a
+                single layer.
+            extra_hosts (dict): Extra hosts to add to /etc/hosts in building
+                containers, as a mapping of hostname to IP address.
+            platform (str): Platform in the format ``os[/arch[/variant]]``
 
         Returns:
             A generator for the build output.
@@ -140,22 +142,13 @@ class BuildApiMixin(object):
             exclude = None
             if os.path.exists(dockerignore):
                 with open(dockerignore, 'r') as f:
-                    exclude = list(filter(bool, f.read().splitlines()))
+                    exclude = list(filter(
+                        bool, [l.strip() for l in f.read().splitlines()]
+                    ))
             context = utils.tar(
                 path, exclude=exclude, dockerfile=dockerfile, gzip=gzip
             )
             encoding = 'gzip' if gzip else encoding
-
-        if utils.compare_version('1.8', self._version) >= 0:
-            stream = True
-
-        if dockerfile and utils.compare_version('1.17', self._version) < 0:
-            raise errors.InvalidVersion(
-                'dockerfile was only introduced in API version 1.17'
-            )
-
-        if utils.compare_version('1.19', self._version) < 0:
-            pull = 1 if pull else 0
 
         u = self._url('/build')
         params = {
@@ -171,12 +164,7 @@ class BuildApiMixin(object):
         params.update(container_limits)
 
         if buildargs:
-            if utils.version_gte(self._version, '1.21'):
-                params.update({'buildargs': json.dumps(buildargs)})
-            else:
-                raise errors.InvalidVersion(
-                    'buildargs was only introduced in API version 1.21'
-                )
+            params.update({'buildargs': json.dumps(buildargs)})
 
         if shmsize:
             if utils.version_gte(self._version, '1.22'):
@@ -218,35 +206,51 @@ class BuildApiMixin(object):
                     'network_mode was only introduced in API version 1.25'
                 )
 
+        if squash:
+            if utils.version_gte(self._version, '1.25'):
+                params.update({'squash': squash})
+            else:
+                raise errors.InvalidVersion(
+                    'squash was only introduced in API version 1.25'
+                )
+
+        if extra_hosts is not None:
+            if utils.version_lt(self._version, '1.27'):
+                raise errors.InvalidVersion(
+                    'extra_hosts was only introduced in API version 1.27'
+                )
+
+            if isinstance(extra_hosts, dict):
+                extra_hosts = utils.format_extra_hosts(extra_hosts)
+            params.update({'extrahosts': extra_hosts})
+
+        if platform is not None:
+            if utils.version_lt(self._version, '1.32'):
+                raise errors.InvalidVersion(
+                    'platform was only introduced in API version 1.32'
+                )
+            params['platform'] = platform
+
         if context is not None:
             headers = {'Content-Type': 'application/tar'}
             if encoding:
                 headers['Content-Encoding'] = encoding
 
-        if utils.compare_version('1.9', self._version) >= 0:
-            self._set_auth_headers(headers)
+        self._set_auth_headers(headers)
 
         response = self._post(
             u,
             data=context,
             params=params,
             headers=headers,
-            stream=stream,
+            stream=True,
             timeout=timeout,
         )
 
         if context is not None and not custom_context:
             context.close()
 
-        if stream:
-            return self._stream_helper(response, decode=decode)
-        else:
-            output = self._result(response)
-            srch = r'Successfully built ([0-9a-f]+)'
-            match = re.search(srch, output)
-            if not match:
-                return None, output
-            return match.group(1), output
+        return self._stream_helper(response, decode=decode)
 
     def _set_auth_headers(self, headers):
         log.debug('Looking for auth config')
@@ -267,14 +271,15 @@ class BuildApiMixin(object):
                 # Matches CLI behavior: https://github.com/docker/docker/blob/
                 # 67b85f9d26f1b0b2b240f2d794748fac0f45243c/cliconfig/
                 # credentials/native_store.go#L68-L83
-                for registry in self._auth_configs.keys():
-                    if registry == 'credsStore' or registry == 'HttpHeaders':
-                        continue
+                for registry in self._auth_configs.get('auths', {}).keys():
                     auth_data[registry] = auth.resolve_authconfig(
                         self._auth_configs, registry
                     )
             else:
-                auth_data = self._auth_configs
+                auth_data = self._auth_configs.get('auths', {}).copy()
+                # See https://github.com/docker/docker-py/issues/1683
+                if auth.INDEX_NAME in auth_data:
+                    auth_data[auth.INDEX_URL] = auth_data[auth.INDEX_NAME]
 
             log.debug(
                 'Sending auth config ({0})'.format(
@@ -282,13 +287,8 @@ class BuildApiMixin(object):
                 )
             )
 
-            if utils.compare_version('1.19', self._version) >= 0:
-                headers['X-Registry-Config'] = auth.encode_header(
-                    auth_data
-                )
-            else:
-                headers['X-Registry-Config'] = auth.encode_header({
-                    'configs': auth_data
-                })
+            headers['X-Registry-Config'] = auth.encode_header(
+                auth_data
+            )
         else:
             log.debug('No auth config found')

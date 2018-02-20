@@ -1,9 +1,12 @@
+import itertools
 import re
 
 import six
 
 from ..api import APIClient
-from ..errors import BuildError
+from ..constants import DEFAULT_DATA_CHUNK_SIZE
+from ..errors import BuildError, ImageLoadError
+from ..utils import parse_repository_tag
 from ..utils.json_stream import json_stream
 from .resource import Collection, Model
 
@@ -56,13 +59,17 @@ class Image(Model):
         """
         return self.client.api.history(self.id)
 
-    def save(self):
+    def save(self, chunk_size=DEFAULT_DATA_CHUNK_SIZE):
         """
         Get a tarball of an image. Similar to the ``docker save`` command.
 
+        Args:
+            chunk_size (int): The number of bytes returned by each iteration
+                of the generator. If ``None``, data will be streamed as it is
+                received. Default: 2 MB
+
         Returns:
-            (urllib3.response.HTTPResponse object): The response from the
-            daemon.
+            (generator): A stream of raw archive data.
 
         Raises:
             :py:class:`docker.errors.APIError`
@@ -70,14 +77,13 @@ class Image(Model):
 
         Example:
 
-            >>> image = cli.images.get("fedora:latest")
-            >>> resp = image.save()
-            >>> f = open('/tmp/fedora-latest.tar', 'w')
-            >>> for chunk in resp.stream():
-            >>>     f.write(chunk)
+            >>> image = cli.get_image("busybox:latest")
+            >>> f = open('/tmp/busybox-latest.tar', 'w')
+            >>> for chunk in image:
+            >>>   f.write(chunk)
             >>> f.close()
         """
-        return self.client.api.get_image(self.id)
+        return self.client.api.get_image(self.id, chunk_size)
 
     def tag(self, repository, tag=None, **kwargs):
         """
@@ -153,9 +159,16 @@ class ImageCollection(Collection):
                 Dockerfile
             network_mode (str): networking mode for the run commands during
                 build
+            squash (bool): Squash the resulting images layers into a
+                single layer.
+            extra_hosts (dict): Extra hosts to add to /etc/hosts in building
+                containers, as a mapping of hostname to IP address.
+            platform (str): Platform in the format ``os[/arch[/variant]]``.
 
         Returns:
-            (:py:class:`Image`): The built image.
+            (tuple): The first item is the :py:class:`Image` object for the
+                image that was build. The second item is a generator of the
+                build logs as JSON-decoded objects.
 
         Raises:
             :py:class:`docker.errors.BuildError`
@@ -170,9 +183,10 @@ class ImageCollection(Collection):
             return self.get(resp)
         last_event = None
         image_id = None
-        for chunk in json_stream(resp):
+        result_stream, internal_stream = itertools.tee(json_stream(resp))
+        for chunk in internal_stream:
             if 'error' in chunk:
-                raise BuildError(chunk['error'])
+                raise BuildError(chunk['error'], result_stream)
             if 'stream' in chunk:
                 match = re.search(
                     r'(^Successfully built |sha256:)([0-9a-f]+)$',
@@ -182,8 +196,8 @@ class ImageCollection(Collection):
                     image_id = match.group(2)
             last_event = chunk
         if image_id:
-            return self.get(image_id)
-        raise BuildError(last_event or 'Unknown')
+            return (self.get(image_id), result_stream)
+        raise BuildError(last_event or 'Unknown', result_stream)
 
     def get(self, name):
         """
@@ -224,7 +238,7 @@ class ImageCollection(Collection):
                 If the server returns an error.
         """
         resp = self.client.api.images(name=name, all=all, filters=filters)
-        return [self.prepare_model(r) for r in resp]
+        return [self.get(r["Id"]) for r in resp]
 
     def load(self, data):
         """
@@ -235,32 +249,53 @@ class ImageCollection(Collection):
         Args:
             data (binary): Image data to be loaded.
 
+        Returns:
+            (list of :py:class:`Image`): The images.
+
         Raises:
             :py:class:`docker.errors.APIError`
                 If the server returns an error.
         """
-        return self.client.api.load_image(data)
+        resp = self.client.api.load_image(data)
+        images = []
+        for chunk in resp:
+            if 'stream' in chunk:
+                match = re.search(
+                    r'(^Loaded image ID: |^Loaded image: )(.+)$',
+                    chunk['stream']
+                )
+                if match:
+                    image_id = match.group(2)
+                    images.append(image_id)
+            if 'error' in chunk:
+                raise ImageLoadError(chunk['error'])
 
-    def pull(self, name, tag=None, **kwargs):
+        return [self.get(i) for i in images]
+
+    def pull(self, repository, tag=None, **kwargs):
         """
         Pull an image of the given name and return it. Similar to the
         ``docker pull`` command.
+        If no tag is specified, all tags from that repository will be
+        pulled.
 
         If you want to get the raw pull output, use the
         :py:meth:`~docker.api.image.ImageApiMixin.pull` method in the
         low-level API.
 
         Args:
-            repository (str): The repository to pull
+            name (str): The repository to pull
             tag (str): The tag to pull
-            insecure_registry (bool): Use an insecure registry
             auth_config (dict): Override the credentials that
                 :py:meth:`~docker.client.DockerClient.login` has set for
                 this request. ``auth_config`` should contain the ``username``
                 and ``password`` keys to be valid.
+            platform (str): Platform in the format ``os[/arch[/variant]]``
 
         Returns:
-            (:py:class:`Image`): The image that has been pulled.
+            (:py:class:`Image` or list): The image that has been pulled.
+                If no ``tag`` was specified, the method will return a list
+                of :py:class:`Image` objects belonging to this repository.
 
         Raises:
             :py:class:`docker.errors.APIError`
@@ -268,10 +303,19 @@ class ImageCollection(Collection):
 
         Example:
 
-            >>> image = client.images.pull('busybox')
+            >>> # Pull the image tagged `latest` in the busybox repo
+            >>> image = client.images.pull('busybox:latest')
+
+            >>> # Pull all tags in the busybox repo
+            >>> images = client.images.pull('busybox')
         """
-        self.client.api.pull(name, tag=tag, **kwargs)
-        return self.get('{0}:{1}'.format(name, tag) if tag else name)
+        if not tag:
+            repository, tag = parse_repository_tag(repository)
+
+        self.client.api.pull(repository, tag=tag, **kwargs)
+        if tag:
+            return self.get('{0}:{1}'.format(repository, tag))
+        return self.list(repository)
 
     def push(self, repository, tag=None, **kwargs):
         return self.client.api.push(repository, tag=tag, **kwargs)

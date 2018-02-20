@@ -20,14 +20,11 @@ ROOT_DIR = os.path.dirname(__file__)
 SOURCE_DIR = os.path.join(ROOT_DIR)
 
 requirements = [
-    'requests >= 2.5.2, != 2.11.0, != 2.12.2, != 2.18.0',
+    'requests >= 2.14.2, != 2.18.0',
     'six >= 1.4.0',
     'websocket-client >= 0.32.0',
-    'docker-pycreds >= 0.2.1'
+    'docker-pycreds >= 0.2.2'
 ]
-
-if sys.platform == 'win32':
-    requirements.append('pypiwin32 >= 219')
 
 extras_require = {
     ':python_version < "3.5"': 'backports.ssl_match_hostname >= 3.5',
@@ -35,6 +32,22 @@ extras_require = {
     # ssl_match_hostname to verify hosts match with certificates via
     # ServerAltname: https://pypi.python.org/pypi/backports.ssl_match_hostname
     ':python_version < "3.3"': 'ipaddress >= 1.0.16',
+
+    # win32 APIs if on Windows (required for npipe support)
+    # Python 3.6 is only compatible with v220 ; Python < 3.5 is not supported
+    # on v220 ; ALL versions are broken for v222 (as of 2018-01-26)
+    ':sys_platform == "win32" and python_version < "3.6"': 'pypiwin32==219',
+    ':sys_platform == "win32" and python_version >= "3.6"': 'pypiwin32==220',
+
+    # If using docker-py over TLS, highly recommend this option is
+    # pip-installed or pinned.
+
+    # TODO: if pip installing both "requests" and "requests[security]", the
+    # extra package from the "security" option are not installed (see
+    # https://github.com/pypa/pip/issues/4391).  Once that's fixed, instead of
+    # installing the extra dependencies, install the following instead:
+    # 'requests[security] >= 2.5.2, != 2.11.0, != 2.12.2'
+    'tls': ['pyOpenSSL>=0.14', 'cryptography>=1.3.4', 'idna>=2.0.0'],
 }
 
 version = None
@@ -77,6 +90,7 @@ setup(
         'Programming Language :: Python :: 3.3',
         'Programming Language :: Python :: 3.4',
         'Programming Language :: Python :: 3.5',
+        'Programming Language :: Python :: 3.6',
         'Topic :: Utilities',
         'License :: OSI Approved :: Apache Software License',
     ],
